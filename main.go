@@ -82,19 +82,34 @@ func (s *BugService) List(statusFilter string) []*BugMeta {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	if statusFilter == "" || statusFilter == "all" {
-		res := make([]*BugMeta, len(s.index))
-		copy(res, s.index)
-		return res
+	files, err := filepath.Glob(filepath.Join(s.baseDir, "*.md"))
+	if err != nil {
+		return nil
 	}
 
-	var res []*BugMeta
-	for _, m := range s.index {
-		if m.Status == statusFilter {
-			res = append(res, m)
+	all := make([]*BugMeta, 0, len(files))
+	for _, f := range files {
+		bug, err := s.parseMarkdown(f)
+		if err == nil {
+			all = append(all, &bug.BugMeta)
 		}
 	}
-	return res
+
+	sort.Slice(all, func(i, j int) bool {
+		return all[i].CreatedAt.After(all[j].CreatedAt)
+	})
+
+	if statusFilter == "" || statusFilter == "all" {
+		return all
+	}
+
+	var filtered []*BugMeta
+	for _, m := range all {
+		if m.Status == statusFilter {
+			filtered = append(filtered, m)
+		}
+	}
+	return filtered
 }
 
 func (s *BugService) Get(id string) (*Bug, error) {
@@ -689,14 +704,53 @@ func cmdDelete(svc *BugService, args []string) {
 }
 
 func printHelp() {
-	fmt.Println(`Bug Tracker CLI Usage:
-  bug web              Start the Web Server (default)
-  bug add              Interactive mode to add a new bug
-  bug list             List all bugs
-  bug show <id>        Show full details of a bug
-  bug edit <id>        Open the bug in your default text editor
-  bug status <id> <s>  Quickly update a bug's status (open/fixed/closed)
-  bug delete <id>      Delete a bug and its images`)
+	fmt.Println(`Bug Tracker — 单文件零依赖 Bug 跟踪器
+
+━━━━ 基本命令 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  bug web                启动 Web 服务器（默认，端口 8601）
+  bug list               列出所有 bugs
+  bug show <id>          显示 bug 详情
+  bug add                交互式添加新 bug
+  bug edit <id>          用编辑器修改 bug
+  bug status <id> <s>    更新 bug 状态
+  bug delete <id>        删除 bug
+
+━━━━ Bug 状态说明 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  状态      含义          使用场景
+  ─────     ─────────    ────────────────────
+  open      开放的       待处理的缺陷或需求
+  fixed     已修复       代码已修复，等待验证
+  closed    已关闭       验证通过或放弃
+
+━━━━ Bug ID 格式 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  格式：YYYYMMDD-HHmmss
+  示例：20260428-105138
+  含义：创建时的日期时间戳
+
+━━━━ 字段说明 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  ID        唯一标识，格式为 YYYYMMDD-HHmmss
+  Status    状态：open / fixed / closed
+  Title     bug 或需求的简短描述
+  Created   创建时间（ISO 8601 格式）
+  Updated   最后更新时间
+
+━━━━ 推荐工作流 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  1. 在浏览器或 CLI 创建 bug（状态为 open）
+  2. 修复后执行  bug status <id> fixed
+  3. 验证通过后执行  bug status <id> closed
+  4. 如验证失败，重新打开或创建新 bug
+
+━━━━ 存储结构 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  bugs/          bug 文件目录（.md 格式，YAML 头 + Markdown 正文）
+  bugs/images/   附件图片目录
+
+数据存储在本地文件系统中，无需数据库。`)
 }
 
 // =====================================================================
