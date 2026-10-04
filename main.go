@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"html/template"
 	"io"
@@ -280,12 +281,62 @@ func (s *BugService) saveMarkdown(bug *Bug) error {
 	return os.WriteFile(path, buf.Bytes(), 0644)
 }
 
+// --------------- 工具函数 ---------------
+
+func truncate(s string, n int) string {
+	runes := []rune(s)
+	if len(runes) > n {
+		return string(runes[:n]) + "..."
+	}
+	return s
+}
+
+// --------------- 反馈 ---------------
+
+func (s *BugService) CreateFeedback(content, page, pageTitle, userAgent string) (*Bug, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	now := time.Now()
+	id := now.Format("20060102-150405")
+
+	// 自动生成标题
+	title := "用户反馈"
+	if pageTitle != "" {
+		title += ": " + truncate(pageTitle, 30)
+	}
+
+	body := content
+	body += "\n\n---\n"
+	body += fmt.Sprintf("页面: %s\n", page)
+	body += fmt.Sprintf("User-Agent: %s\n", userAgent)
+
+	bug := &Bug{
+		BugMeta: BugMeta{
+			ID:        id,
+			Title:     title,
+			Status:    "feedback",
+			CreatedAt: now,
+			UpdatedAt: now,
+		},
+		Body: body,
+	}
+
+	if err := s.saveMarkdown(bug); err != nil {
+		return nil, err
+	}
+
+	s.index = append([]*BugMeta{&bug.BugMeta}, s.index...)
+	return bug, nil
+}
+
 // =====================================================================
 // 3. Web 层 (HTTP Handlers)
 // =====================================================================
 
 type WebHandler struct {
-	svc *BugService
+	svc            *BugService
+	allowedOrigins []string
 }
 
 func (h *WebHandler) RegisterRoutes(mux *http.ServeMux) {
@@ -298,6 +349,9 @@ func (h *WebHandler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/bugs/{id}", h.ApiUpdate)
 	mux.HandleFunc("POST /api/bugs/{id}/status", h.ApiUpdateStatus)
 	mux.HandleFunc("POST /api/bugs/{id}/delete", h.ApiDelete)
+
+	mux.HandleFunc("POST /api/feedback", h.ApiFeedback)
+	mux.HandleFunc("OPTIONS /api/feedback", h.ApiFeedbackOptions)
 
 	mux.Handle("GET /images/", http.StripPrefix("/images/", http.FileServer(http.Dir(h.svc.imgDir))))
 }
@@ -437,6 +491,73 @@ func (h *WebHandler) ApiDelete(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
 
+// --------------- 反馈 API ---------------
+
+func (h *WebHandler) setCORSHeaders(w http.ResponseWriter, r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return true // 同源请求，无需 CORS
+	}
+	allowed := false
+	for _, o := range h.allowedOrigins {
+		if origin == o || o == "*" {
+			allowed = true
+			break
+		}
+	}
+	if !allowed {
+		return false
+	}
+	w.Header().Set("Access-Control-Allow-Origin", origin)
+	w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+	return true
+}
+
+func (h *WebHandler) ApiFeedbackOptions(w http.ResponseWriter, r *http.Request) {
+	h.setCORSHeaders(w, r)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (h *WebHandler) ApiFeedback(w http.ResponseWriter, r *http.Request) {
+	if !h.setCORSHeaders(w, r) {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
+	var req struct {
+		Content   string `json:"content"`
+		Page      string `json:"page"`
+		PageTitle string `json:"pageTitle"`
+		UserAgent string `json:"userAgent"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, `{"error":"invalid JSON"}`, http.StatusBadRequest)
+		return
+	}
+
+	if strings.TrimSpace(req.Content) == "" {
+		http.Error(w, `{"error":"content is required"}`, http.StatusBadRequest)
+		return
+	}
+
+	_, err := h.svc.CreateFeedback(
+		strings.TrimSpace(req.Content),
+		req.Page,
+		req.PageTitle,
+		req.UserAgent,
+	)
+	if err != nil {
+		http.Error(w, `{"error":"save failed"}`, http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(`{"status":"ok"}`))
+}
+
 // ---------------- HTML/CSS 视图模板 ----------------
 const (
 	tplLayout = `<!DOCTYPE html>
@@ -477,7 +598,8 @@ input[type="text"], select, textarea { width: 100%; padding: 8px; margin: 5px 0 
 	<a href="/">All</a> | 
 	<a href="/?status=open">Open</a> | 
 	<a href="/?status=fixed">Fixed</a> | 
-	<a href="/?status=closed">Closed</a>
+	<a href="/?status=closed">Closed</a> | 
+	<a href="/?status=feedback">Feedback</a>
 </div>
 <table style="width:100%; border-collapse: collapse;">
 	<thead>
@@ -703,18 +825,140 @@ func cmdDelete(svc *BugService, args []string) {
 	fmt.Println("Bug deleted.")
 }
 
+// --------------- 服务管理 ---------------
+
+func cmdInstall(args []string) {
+	binaryPath, err := os.Executable()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: failed to get binary path: %v\n", err)
+		os.Exit(1)
+	}
+	binaryPath, _ = filepath.Abs(binaryPath)
+
+	execArgs := binaryPath
+	if len(args) > 0 {
+		execArgs = binaryPath + " " + strings.Join(args, " ")
+	}
+
+	unitName := "bug.service"
+	unitContent := fmt.Sprintf(`[Unit]
+Description=Bug Tracker Web Server
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=%s
+Restart=always
+RestartSec=5s
+WorkingDirectory=/var/lib/bug
+
+[Install]
+WantedBy=multi-user.target
+`, execArgs)
+
+	tmpFile, err := os.CreateTemp("", "bug.*.service")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: failed to create temp file: %v\n", err)
+		os.Exit(1)
+	}
+	defer os.Remove(tmpFile.Name())
+
+	if _, err := tmpFile.WriteString(unitContent); err != nil {
+		tmpFile.Close()
+		fmt.Fprintf(os.Stderr, "error: failed to write unit file: %v\n", err)
+		os.Exit(1)
+	}
+	tmpFile.Close()
+
+	if err := runSudo("cp", tmpFile.Name(), "/etc/systemd/system/"+unitName); err != nil {
+		os.Exit(1)
+	}
+	if err := runSudo("systemctl", "daemon-reload"); err != nil {
+		os.Exit(1)
+	}
+	if err := runSudo("systemctl", "enable", unitName); err != nil {
+		os.Exit(1)
+	}
+	if err := runSudo("systemctl", "start", unitName); err != nil {
+		os.Exit(1)
+	}
+
+	fmt.Println("Service installed and started successfully.")
+	fmt.Printf("  Unit: /etc/systemd/system/%s\n", unitName)
+	fmt.Printf("  Binary: %s\n", binaryPath)
+	fmt.Printf("  Data: /var/lib/bug/bugs/\n")
+}
+
+func cmdUninstall() {
+	unitName := "bug.service"
+
+	runSudo("systemctl", "stop", unitName)
+	runSudo("systemctl", "disable", unitName)
+	runSudo("rm", "-f", "/etc/systemd/system/"+unitName)
+	runSudo("systemctl", "daemon-reload")
+
+	fmt.Println("Service uninstalled successfully.")
+}
+
+func cmdStart(args []string) {
+	binaryPath, err := os.Executable()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: failed to get binary path: %v\n", err)
+		os.Exit(1)
+	}
+	binaryPath, _ = filepath.Abs(binaryPath)
+
+	allArgs := []string{binaryPath}
+	allArgs = append(allArgs, args...)
+
+	cmd := exec.Command("nohup", allArgs...)
+	logFile := binaryPath + ".log"
+	f, err := os.OpenFile(logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: failed to open log file: %v\n", err)
+		os.Exit(1)
+	}
+	cmd.Stdout = f
+	cmd.Stderr = f
+	cmd.Stdin = nil
+
+	if err := cmd.Start(); err != nil {
+		fmt.Fprintf(os.Stderr, "error: failed to start: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("Server started in background (PID: %d)\n", cmd.Process.Pid)
+	fmt.Printf("Log: %s\n", logFile)
+}
+
+func runSudo(command string, args ...string) error {
+	fullArgs := append([]string{command}, args...)
+	c := exec.Command("sudo", fullArgs...)
+	c.Stdin = os.Stdin
+	c.Stdout = os.Stdout
+	c.Stderr = os.Stderr
+	return c.Run()
+}
+
 func printHelp() {
 	fmt.Println(`Bug Tracker — 单文件零依赖 Bug 跟踪器
 
 ━━━━ 基本命令 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-  bug web                启动 Web 服务器（默认，端口 8601）
+  bug                    启动 Web 服务器（默认，端口 8601）
+  bug web                启动 Web 服务器（端口 8601）
   bug list               列出所有 bugs
   bug show <id>          显示 bug 详情
   bug add                交互式添加新 bug
   bug edit <id>          用编辑器修改 bug
   bug status <id> <s>    更新 bug 状态
   bug delete <id>        删除 bug
+
+━━━━ 服务管理 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  bug install [-- <额外参数>]  安装并启动 systemd 服务
+  bug uninstall               卸载 systemd 服务
+  bug start [-- <额外参数>]    nohup 后台运行
 
 ━━━━ Bug 状态说明 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -723,6 +967,7 @@ func printHelp() {
   open      开放的       待处理的缺陷或需求
   fixed     已修复       代码已修复，等待验证
   closed    已关闭       验证通过或放弃
+  feedback  用户反馈     从网站提交的用户反馈
 
 ━━━━ Bug ID 格式 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -733,7 +978,7 @@ func printHelp() {
 ━━━━ 字段说明 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
   ID        唯一标识，格式为 YYYYMMDD-HHmmss
-  Status    状态：open / fixed / closed
+  Status    状态：open / fixed / closed / feedback
   Title     bug 或需求的简短描述
   Created   创建时间（ISO 8601 格式）
   Updated   最后更新时间
@@ -758,13 +1003,29 @@ func printHelp() {
 // =====================================================================
 
 func main() {
+	args := os.Args
+
+	// 服务管理命令不需要初始化 BugService
+	if len(args) >= 2 {
+		switch args[1] {
+		case "install":
+			cmdInstall(args[2:])
+			return
+		case "uninstall":
+			cmdUninstall()
+			return
+		case "start":
+			cmdStart(args[2:])
+			return
+		}
+	}
+
 	svc := NewBugService("./bugs")
 	if err := svc.Init(); err != nil {
 		fmt.Printf("Init failed: %v\n", err)
 		os.Exit(1)
 	}
 
-	args := os.Args
 	isWebMode := len(args) == 1 || (len(args) == 2 && args[1] == "web")
 
 	if isWebMode {
@@ -772,7 +1033,10 @@ func main() {
 		fmt.Printf("Starting Bug Web Server on http://localhost:%s\n", port)
 		
 		mux := http.NewServeMux()
-		handler := &WebHandler{svc: svc}
+		handler := &WebHandler{
+			svc:            svc,
+			allowedOrigins: []string{"http://localhost:4321", "http://127.0.0.1:4321", "https://zhimalab.tech"},
+		}
 		handler.RegisterRoutes(mux)
 		
 		if err := http.ListenAndServe(":"+port, mux); err != nil {

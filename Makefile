@@ -28,6 +28,16 @@ dev:
 	go build -o $(BINARY_LINUX) $(SOURCE)
 	@echo "Build complete for current host."
 
+# Build Linux binary and deploy to remote server
+deploy: linux
+	@echo "Uploading to mm server..."
+	scp $(BINARY_LINUX) mm:/usr/local/bin/
+	@echo "Deploy complete. Binary uploaded to mm:/usr/local/bin/$(BINARY_LINUX)"
+	@echo ""
+	@echo "Next steps (ssh mm):"
+	@echo "  sudo mkdir -p /var/lib/bug"
+	@echo "  sudo bug install"
+
 # Clean built binaries
 clean:
 	rm -f $(BINARY_LINUX)
